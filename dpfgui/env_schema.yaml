@@ -1141,6 +1141,12 @@ parameters:
     type: string
     default: v26.4.1-ocp-release-v4.22-simdpu
 
+  SIMULATED_DPU_OVS_CNI_IMAGE:
+    description: ovs-cni image with simulated SFs, for the simulated DPUs' services (HBN).
+    group: workers
+    type: string
+    default: quay.io/otuchfel/sim-dpu:ovs-cni-simsf-veth2-arm64
+
   WORKER_NODE_LABELS:
     description: Labels applied to the workers.
     group: workers
