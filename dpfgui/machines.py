@@ -34,7 +34,8 @@ def _write(data: dict) -> None:
     _prefs_path().chmod(0o600)
 
 
-REMEMBERED_FIELDS = ("BMC_USER", "BMC_PASSWORD", "BOOT_MAC", "ROOT_DEVICE", "DPU")
+# WORKER_<n>_<field>, plus the Zero Trust DPU<n>_SERIAL and DPU<n>_BMC_IP as DPU_SERIAL and DPU_BMC_IP.
+REMEMBERED_FIELDS = ("BMC_USER", "BMC_PASSWORD", "BOOT_MAC", "ROOT_DEVICE", "DPU", "DPU_SERIAL", "DPU_BMC_IP")
 
 
 def remembered() -> dict[str, dict[str, str]]:

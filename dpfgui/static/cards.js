@@ -249,7 +249,8 @@ function workerDetails(ctx, n, m) {
   const curNic = nics.find(x => x.mac === mac);
   const rec = nics.find(x => x.mac === probe?.data?.recommended);
   let nic;
-  const macBox = () => edit(ctx, k('BOOT_MAC'), { required: true, input: { placeholder: 'aa:bb:cc:dd:ee:ff' } });
+  // Zero Trust never installs the hosts, so it doesn't need their boot NIC.
+  const macBox = () => edit(ctx, k('BOOT_MAC'), { required: !isZt(ctx), input: { placeholder: 'aa:bb:cc:dd:ee:ff' } });
   if (!mac && probe?.loading) nic = `${spin}<span class="muted">asking the BMC…</span>`;
   else if (curNic) nic = `${nicLabel(curNic)} <span class="mono small">${esc(mac)}</span> ${nicLink(curNic)}`;
   // Without the BMC's list of NICs, the MAC is typed (or pasted from the BMC's web page).
@@ -277,6 +278,7 @@ function workerDetails(ctx, n, m) {
       <div class="kv span2"><div class="kv-label">Boot NIC</div><div class="kv-val">${nic}${resetBtn(ctx, k('BOOT_MAC'))}</div>${nicHint ? `<div class="cf-hint">${nicHint}</div>` : ''}</div>
       ${m ? `<div class="kv"><div class="kv-label">Host address</div><div class="kv-val ci-status">${ipLine}</div></div>` : ''}
       ${val(ctx, k('ROOT_DEVICE'), 'Install disk', { show: `<span class="mono">${esc(ctx.eff(k('ROOT_DEVICE')) || '/dev/sda')}</span>`, input: { placeholder: '/dev/sda' } })}
+      ${isZt(ctx) ? ztDpuDetails(ctx, n) : ''}
     </div>${nicList}`;
 }
 
@@ -294,6 +296,74 @@ function workerCustom(ctx, n) {
       ${field(ctx, k('ROOT_DEVICE'), 'Install disk', bindInput(ctx, k('ROOT_DEVICE'), { cls: 'mono', placeholder: '/dev/sda' }))}
     </div>
     <div class="ci-line">${checkbox(k('DPU'), dpuOn, 'This host has a BlueField DPU')}</div>`;
+}
+
+/* Simulated DPU hosts (dpusimaas leases): to a deployment they look like lab DPU hosts. */
+
+const simData = ctx => ctx.lazy('simdpus', () => api('GET', '/api/sim-dpus'));
+const simWorkerLease = (ctx, w) => (simData(ctx).data?.leases || []).find(l => w.name === `sim-${l.id}`);
+const isSimWorker = w => !w.m && /^sim-[0-9a-f]+$/.test(w.name || '');
+
+async function leaseSimDpu(ctx, leaseId) {
+  try {
+    const r = await api('POST', `/api/profiles/${encodeURIComponent(ctx.name)}/sim-dpus`, { settings: ctx.draft(), slots: ctx.workerSlots(), lease_id: leaseId || null });
+    if (r.lease) toast(`${leaseId ? 'Using' : 'Created'} simulated DPU host ${r.lease.id} as worker ${r.worker}. Set: ${r.changed.join(', ')}`);
+    ctx.replace(r.settings);
+  } catch (e) { toast(e.message, 'bad'); ctx.rerender(); }
+  ctx.relazy('simdpus');
+}
+
+async function releaseSimDpu(ctx, leaseId) {
+  const w = selectedWorkers(ctx).find(x => x.name === `sim-${leaseId}`);
+  if (!window.confirm(`Release simulated DPU ${leaseId}? Its VMs and BMCs go away${w ? `, and worker ${w.n} is removed from this profile` : ''}.`)) return;
+  try {
+    await api('DELETE', `/api/sim-dpus/${encodeURIComponent(leaseId)}`);
+    if (w) await removeDpu(ctx, w.n);
+  } catch (e) { toast(e.message, 'bad'); }
+  ctx.relazy('simdpus');
+}
+
+const simLevel = (ctx, l) => simData(ctx).data?.info?.levels?.[l.level] || '';
+const simState = l => ({ waiting: 'waiting for DPF to install it', booting: 'booting', running: 'DPU VM running', 'powered-off': 'host powered off', failed: 'failed', starting: 'starting' })[l.state] || l.state;
+// Only leases that asked for an end have one.
+const simExpires = l => { if (!l.expires) return ''; const h = Math.round((new Date(l.expires) - Date.now()) / 3600e3); return ` · ends in ${h > 48 ? `${Math.round(h / 24)} days` : `${Math.max(h, 0)} h`}`; };
+
+// A simulated DPU host that's one of this profile's workers.
+function simWorkerRow(ctx, w) {
+  const l = simWorkerLease(ctx, w);
+  const detail = l ? `<span class="mono">${esc(l.ip)}</span> · serial <span class="mono">${esc(l.serial.toLowerCase())}</span> · ${esc(simState(l))}${esc(simExpires(l))}`
+    : simData(ctx).loading ? `${spin}<span class="muted">asking dpusimaas…</span>`
+    : `${badIcon()}<span class="ci-bad-text">no such lease any more (expired or released): uncheck it</span>`;
+  return `<div class="dh on"><label class="dh-row">
+      <input type="checkbox" data-dh-n="${w.n}" checked><span class="dh-name">${esc(w.name)}</span><span class="sn-badge" title="${esc(l ? simLevel(ctx, l) : '')}">simulated${l?.level === 'vm' ? ' · DPU VM' : ''}</span>
+      <span class="dh-users small muted">${detail}</span>
+      ${l ? `<span class="dh-links"><button class="link-btn" data-sim-release="${esc(l.id)}">Release</button></span>` : ''}</label></div>`;
+}
+
+// Leasing simulated DPU hosts: what you have, and a button for another.
+function simSection(ctx, full) {
+  const sd = simData(ctx);
+  const head = `<div class="ci-sub">Simulated DPU hosts${infoTip(isZt(ctx) ? 'Leased from dpusimaas: a BlueField BMC (Redfish) and its host’s BMC (IPMI) on an address of their own; once DPF installs an OS, an aarch64 VM boots as the DPU. It’s yours until you release it.' : 'Leased from dpusimaas: a host VM with its BMC (Redfish, IPMI) on an address of its own, which your cluster installs as a worker; once DPF installs an OS on its DPU, an aarch64 VM boots as the DPU, wired to the host. It’s yours until you release it.')}</div>`;
+  if (sd.loading) return `${head}<div class="muted small">${spin} Asking dpusimaas…</div>`;
+  if (sd.data?.error || sd.error) return `${head}<div class="cf-hint">${badIcon()} ${esc(sd.data?.error || sd.error)} <button class="link-btn" data-sim-reload>Try again</button></div>`;
+  const used = new Set(selectedWorkers(ctx).map(w => w.name));
+  const spare = (sd.data.leases || []).filter(l => !used.has(`sim-${l.id}`));
+  const inf = sd.data.info || {};
+  const room = inf.max_dpus - inf.leased;
+  const why = full ? 'No free worker slot' : room <= 0 ? `dpusimaas is full (${inf.max_dpus} DPUs leased)` : '';
+  const rows = spare.map(l => `<div class="dh"><div class="dh-row"><span class="dh-name">sim-${esc(l.id)}</span><span class="sn-badge">${esc(l.mode)}</span>
+      <span class="dh-users small muted"><span class="mono">${esc(l.ip || '')}</span> · ${esc(simState(l))}${esc(simExpires(l))}</span>
+      <span class="dh-links">${l.mode === (isZt(ctx) ? 'zero-trust' : 'host-trusted') && !full ? `<button class="link-btn" data-sim-use="${esc(l.id)}">Use</button> · ` : ''}<button class="link-btn" data-sim-release="${esc(l.id)}">Release</button></span></div></div>`).join('');
+  return `${head}${rows ? `<div class="dh-list">${rows}</div>` : ''}
+    <div class="ci-line"><button class="btn small" data-sim-lease ${why ? `disabled title="${esc(why)}"` : ''}>${icon('plus', 'sm')}Create a simulated DPU host</button>
+      <span class="muted small">${esc(why || `yours until you release it · room for ${room} more`)}</span></div>`;
+}
+
+// How the picked hosts join the cluster (host-trusted only: Zero Trust never installs them).
+function joinSection(ctx, sel) {
+  if (!sel.length || isZt(ctx) || !ctx.row('AUTO_APPROVE_WORKER_CSR')?.known) return '';
+  return `<div class="ci-sub">When they join</div>
+    <div class="ci-line">${checkbox('AUTO_APPROVE_WORKER_CSR', ctx.eff('AUTO_APPROVE_WORKER_CSR') === 'true', 'Approve their certificate requests automatically')}${infoTip('When the DPU hosts join, each asks the cluster for certificates that someone has to approve (oc adm certificate approve). With this on, a CronJob approves every pending request once a minute: all of them, not only the DPU hosts’. (AUTO_APPROVE_WORKER_CSR)')}${resetBtn(ctx, 'AUTO_APPROVE_WORKER_CSR')}</div>`;
 }
 
 const DPUS_CARD = {
@@ -335,8 +405,8 @@ const DPUS_CARD = {
         ${w ? `<div class="dh-detail">${workerDetails(ctx, w.n, m)}</div>` : ''}
       </div>`;
     };
-    // Hosts typed in by hand (not in the lab list) stay visible, checked.
-    const custom = sel.filter(w => !w.m).map(w => `<div class="dh on"><label class="dh-row">
+    // Hosts typed in by hand (not in the lab list) stay visible, checked; simulated ones say so.
+    const custom = sel.filter(w => !w.m && isSimWorker(w)).map(w => simWorkerRow(ctx, w)).join('') + sel.filter(w => !w.m && !isSimWorker(w)).map(w => `<div class="dh on"><label class="dh-row">
         <input type="checkbox" data-dh-n="${w.n}" checked><span class="dh-name">${esc(w.name || `worker ${w.n}`)}</span>
         <span class="small muted">not in the lab list · edit it with ⋯</span></label>
         <div class="dh-detail">${workerDetails(ctx, w.n, null)}</div></div>`).join('');
@@ -345,13 +415,15 @@ const DPUS_CARD = {
     const myDpus = allDpus.filter(m => byId[m.id] || m.users.some(u => me.includes(u)));
     const visible = showAll ? allDpus : myDpus;
     const emptyMine = !showAll && !myDpus.length && !custom;
-    const csr = sel.length && ctx.row('AUTO_APPROVE_WORKER_CSR')?.known ? `<div class="ci-line">${checkbox('AUTO_APPROVE_WORKER_CSR', ctx.eff('AUTO_APPROVE_WORKER_CSR') === 'true', 'Approve their certificate requests automatically')}${infoTip('When the DPU hosts join, each asks the cluster for certificates that someone has to approve (oc adm certificate approve). With this on, a CronJob approves every pending request once a minute: all of them, not only the DPU hosts’. (AUTO_APPROVE_WORKER_CSR)')}${resetBtn(ctx, 'AUTO_APPROVE_WORKER_CSR')}</div>` : '';
-    if (emptyMine) return `<div class="cf-hint">${icon('info', 'sm')} No machines assigned to you. Claim one on ${srcLink}.</div>
-      <div class="ci-line"><button class="btn small" data-dpu-showall>${icon('layers', 'sm')}See all ${allDpus.length} machines</button></div>`;
-    return `${hostSubnetLine(ctx)}${csr}
+    if (emptyMine) return `<div class="cf-hint">${icon('info', 'sm')} No machines assigned to you. Claim one on ${srcLink}, or lease a simulated one below.</div>
+      <div class="ci-line"><button class="btn small" data-dpu-showall>${icon('layers', 'sm')}See all ${allDpus.length} machines</button></div>
+      ${simSection(ctx, full)}`;
+    return `${hostSubnetLine(ctx)}
       <div class="dh-list">${custom}${visible.map(row).join('')}</div>
       <div class="sn-foot muted small"><span>${showAll ? srcLink + ' · ' : ''}<button class="link-btn" data-dpu-showall>${showAll ? 'Show yours' : `See all ${allDpus.length}`}</button> · <button class="link-btn" data-dpu-reload>reload</button></span>
-        <span>${sel.length} of ${slots} slots used</span></div>`;
+        <span>${sel.length} of ${slots} slots used</span></div>
+      ${simSection(ctx, full)}
+      ${joinSection(ctx, sel)}`;
   },
   change(e, ctx) {
     const cb = e.target.closest('[data-dh], [data-dh-n]');
@@ -365,7 +437,15 @@ const DPUS_CARD = {
     const t = e.target.closest('[data-nic-toggle]');
     if (t) { const n = +t.dataset.nicToggle; ctx.ui.nicOpen ??= new Set(); ctx.ui.nicOpen.has(n) ? ctx.ui.nicOpen.delete(n) : ctx.ui.nicOpen.add(n); return ctx.rerender(); }
     if (e.target.closest('[data-dpu-showall]')) { ctx.ui.dpuShowAll = !ctx.ui.dpuShowAll; return ctx.rerender(); }
-    if (e.target.closest('[data-dpu-reload]')) { await loadMachines(true); ctx.reanalyze(); }
+    if (e.target.closest('[data-dpu-reload]')) { await loadMachines(true); ctx.relazy('simdpus'); ctx.reanalyze(); }
+    const dr = e.target.closest('[data-dpubmc-retry]');
+    if (dr) { const n = +dr.dataset.dpubmcRetry; return ctx.relazy(`dpubmc:${ctx.host}|${ctx.eff(`DPU${n}_BMC_IP`)}|${ctx.eff('ZT_DPU_BMC_ROOT_PASSWORD')}`); }
+    if (e.target.closest('[data-sim-lease]')) return leaseSimDpu(ctx, null);
+    const use = e.target.closest('[data-sim-use]');
+    if (use) return leaseSimDpu(ctx, use.dataset.simUse);
+    const rel = e.target.closest('[data-sim-release]');
+    if (rel) { e.preventDefault(); return releaseSimDpu(ctx, rel.dataset.simRelease); }
+    if (e.target.closest('[data-sim-reload]')) return ctx.relazy('simdpus');
   },
 };
 
@@ -1001,6 +1081,99 @@ const HOSTED_CARD = {
   },
 };
 
+/* ── Deployment mode: host-trusted or Zero Trust ────────────────────── */
+
+const ZT_KEYS = ['DPF_DEPLOYMENT_MODE', 'ZT_DPU_BMC_ROOT_PASSWORD', 'ZT_DPU_DISCOVERY_MODE',
+  'ZT_DPU_BMC_IP_RANGE_START', 'ZT_DPU_BMC_IP_RANGE_END'];
+const isZt = ctx => ctx.eff('DPF_DEPLOYMENT_MODE') === 'zero-trust';
+
+// Ask DPU n's own BMC (as root) for its serial and whether rshim runs there. Fills in the serial when
+// there's none yet.
+function probeDpuBmc(ctx, n) {
+  const bmc = ctx.eff(`DPU${n}_BMC_IP`), password = ctx.eff('ZT_DPU_BMC_ROOT_PASSWORD');
+  if (!bmc || !password) return null;
+  const entry = ctx.lazy(`dpubmc:${ctx.host}|${bmc}|${password}`, () => api('POST', ctx.url('dpu-bmc-probe'), { bmc, password }));
+  entry.onData ??= d => {
+    // Workers may have been renumbered meanwhile: find this DPU's slot now.
+    const w = selectedWorkers(ctx).find(x => ctx.eff(`DPU${x.n}_BMC_IP`) === bmc);
+    if (w && d.serial && !ctx.eff(`DPU${w.n}_SERIAL`)) ctx.set({ [`DPU${w.n}_SERIAL`]: d.serial });
+  };
+  return entry;
+}
+
+// Zero Trust: a real DPU host's DPU, its BMC address and serial, checked against what that BMC says.
+function ztDpuDetails(ctx, n) {
+  const sk = `DPU${n}_SERIAL`, bk = `DPU${n}_BMC_IP`;
+  const static_ = ctx.eff('ZT_DPU_DISCOVERY_MODE') === 'static';
+  const probe = probeDpuBmc(ctx, n);
+  const serial = ctx.eff(sk) || '', d = probe?.data;
+  let state = '';
+  if (!ctx.eff(bk) || !ctx.eff('ZT_DPU_BMC_ROOT_PASSWORD')) state = '';
+  else if (!probe || probe.loading) state = `${spin}<span class="muted">asking the DPU’s BMC…</span>`;
+  else if (d?.auth === false) state = `${badIcon()}<span class="ci-bad-text">the DPU’s BMC refused the root password</span>`;
+  else if (!d?.auth) state = `<span class="muted">can’t ask the DPU’s BMC: ${esc(d?.error || probe.error || '')}</span> <button class="link-btn" data-dpubmc-retry="${n}">Try again</button>`;
+  else {
+    const ser = !d.serial ? '' : d.serial === serial ? `${okIcon()}<span class="ci-ok-text">serial matches</span>`
+      : `${badIcon()}<span class="ci-bad-text">the BMC says ${esc(d.serial)}</span> <button class="ci-chip" data-set="${sk}" data-val="${esc(d.serial)}">Use it</button>`;
+    const rshim = d.rshim === false ? ` ${badIcon()}<span class="ci-bad-text">rshim off: run <code>systemctl enable --now rshim</code> on the DPU BMC</span>` : '';
+    state = ser + rshim;
+  }
+  return `<div class="kv"><div class="kv-label">DPU BMC</div><div class="kv-val">${edit(ctx, bk, { required: static_, input: { placeholder: static_ ? 'required' : 'address' } })}</div></div>
+    <div class="kv"><div class="kv-label">DPU serial</div><div class="kv-val">${edit(ctx, sk, { required: true, input: { placeholder: 'from its BMC' } })}</div>${state ? `<div class="ci-status">${state}</div>` : ''}</div>`;
+}
+
+const ZT_CARD = {
+  icon: 'key',
+  title: () => 'Deployment mode',
+  sub(ctx) {
+    if (!isZt(ctx)) return 'Host-trusted';
+    const scan = ctx.eff('ZT_DPU_DISCOVERY_MODE') === 'scanning';
+    const range = scan ? `scanning ${ctx.eff('ZT_DPU_BMC_IP_RANGE_START') || '?'}–${ctx.eff('ZT_DPU_BMC_IP_RANGE_END') || '?'}` : 'static DPU list';
+    const n = selectedWorkers(ctx).filter(w => ctx.eff(`DPU${w.n}_SERIAL`)).length;
+    return `Zero Trust · ${range} · ${n} DPU${n === 1 ? '' : 's'}`;
+  },
+  render(ctx) {
+    const zt = isZt(ctx);
+    if (ctx.adv) {
+      return ZT_KEYS.filter(k => ctx.row(k)?.known).map(k => field(ctx, k, k, bindInput(ctx, k, { cls: 'mono' }), '', ctx.row(k)?.description)).join('');
+    }
+    const modes = `<div class="seg">
+        <button data-set="DPF_DEPLOYMENT_MODE" data-val="host-trusted" class="${zt ? '' : 'active'}">Host-trusted</button>
+        <button data-set="DPF_DEPLOYMENT_MODE" data-val="zero-trust" class="${zt ? 'active' : ''}">Zero Trust</button></div>${resetBtn(ctx, 'DPF_DEPLOYMENT_MODE')}`;
+    const head = `<div class="kv-grid wide"><div class="kv"><div class="kv-label">Trust model${infoTip('Host-trusted: DPF provisions DPUs through their hosts (make all). Zero Trust: through each DPU’s own BMC over Redfish (make all-zt). An installed cluster can’t switch. (DPF_DEPLOYMENT_MODE)')}</div>
+      <div class="kv-val">${modes}</div></div></div>`;
+    if (!zt) return head;
+
+    // What Zero Trust needs from other settings: only said when it's wrong, with the fix.
+    const needs = [];
+    if (ctx.eff('NODES_MTU') !== '9000') needs.push(`${badIcon()}<span class="ci-bad-text">Zero Trust installs with MTU 9000; NODES_MTU is ${esc(ctx.eff('NODES_MTU') || '?')}</span> <button class="ci-chip" data-set="NODES_MTU" data-val="9000">Set 9000</button>`);
+    if (ctx.eff('HYPERSHIFT_INSTALL_METHOD') !== 'binary') needs.push(`${badIcon()}<span class="ci-bad-text">Zero Trust installs HyperShift with the hypershift CLI</span> <button class="ci-chip" data-set="HYPERSHIFT_INSTALL_METHOD" data-val="binary">Use it</button>`);
+
+    const real = selectedWorkers(ctx).filter(w => !isSimWorker(w));
+    // Real DPUs need the shared root password and a way for DPF to find them; simulated ones bring both.
+    let realPart = '';
+    if (real.length) {
+      const pwType = ctx.ui.reveal.has('ZT_DPU_BMC_ROOT_PASSWORD') ? 'text' : 'password';
+      const probes = real.map(w => probeDpuBmc(ctx, w.n)?.data).filter(Boolean);
+      const pwState = probes.some(d => d.auth === false) ? `${badIcon()}<span class="ci-bad-text">refused by ${probes.filter(d => d.auth === false).length} DPU BMC(s)</span>`
+        : probes.some(d => d.auth) ? `${okIcon()}<span class="ci-ok-text">accepted by ${probes.filter(d => d.auth).length} DPU BMC(s)</span>` : '';
+      const scan = ctx.eff('ZT_DPU_DISCOVERY_MODE') !== 'static';
+      realPart = `<div class="cf-hint">${icon('info', 'sm')} On each DPU BMC, by hand: the same root password, and <code>systemctl enable --now rshim</code>.</div>
+        <div class="kv-grid wide">
+        <div class="kv"><div class="kv-label">DPU BMC root password${infoTip('DPF logs in to every DPU BMC as root with it. (ZT_DPU_BMC_ROOT_PASSWORD)')}</div>
+          <div class="kv-val"><div class="ci-row">${edit(ctx, 'ZT_DPU_BMC_ROOT_PASSWORD', { required: true, show: '<span class="mono">••••••</span>', input: { cls: 'mono ci-user', type: pwType, placeholder: 'required' } })}
+          ${isMine(ctx, 'ZT_DPU_BMC_ROOT_PASSWORD') ? `<button class="vc-btn" data-reveal-key="ZT_DPU_BMC_ROOT_PASSWORD" title="Show/hide the password">${icon('eye', 'sm')}</button>` : ''}</div></div>
+          ${pwState ? `<div class="ci-status">${pwState}</div>` : ''}</div>
+        ${choice(ctx, 'ZT_DPU_DISCOVERY_MODE', 'Finding the DPUs', [['scanning', 'scan a range'], ['static', 'list each DPU']])}
+        ${scan ? `<div class="kv"><div class="kv-label">DPU BMC range</div><div class="kv-val">${edit(ctx, 'ZT_DPU_BMC_IP_RANGE_START', { required: true, input: { placeholder: 'first' } })} – ${edit(ctx, 'ZT_DPU_BMC_IP_RANGE_END', { required: true, input: { placeholder: 'last' } })}</div></div>` : ''}
+        </div>`;
+    }
+    return `${head}
+      ${needs.length ? `<div class="ci-status">${needs.join('<br>')}</div>` : ''}
+      ${realPart}`;
+  },
+};
+
 /* ── Advanced tabs: the repo's other settings, by what they're for ──── */
 
 // Each tab: [setting, label, {choices: [[value, label]], when: ctx => applies?, why, empty}]. Nothing
@@ -1038,6 +1211,12 @@ const ADV_TABS = [
     ] },
     { title: 'Network', keys: [['FLANNEL_POD_CIDR', 'Pod network (Flannel)']] },
   ] },
+  { id: 'ztprov', title: 'Zero Trust provisioning', icon: 'key', sections: [{ keys: [
+    ['ZT_DPU_REBOOT_IMAGE', 'Host reset image', { when: isZt, why: 'Only used with Zero Trust' }],
+    ['ZT_BFB_REGISTRY_PORT', 'BFB registry port', { when: isZt, why: 'Only used with Zero Trust' }],
+    ['ZT_DPU_DISCOVERY_NAME', 'DPUDiscovery name', { when: ctx => isZt(ctx) && ctx.eff('ZT_DPU_DISCOVERY_MODE') === 'scanning', why: 'Only used when scanning for DPUs' }],
+    ['ZT_DPU_DISCOVERY_SCAN_INTERVAL', 'Rescan every', { when: ctx => isZt(ctx) && ctx.eff('ZT_DPU_DISCOVERY_MODE') === 'scanning', why: 'Only used when scanning for DPUs' }],
+  ] }] },
   { id: 'joining', title: 'DPU host provisioning', icon: 'power', sections: [{ keys: [
     ['WORKER_POWER_ON_DELAY', 'Wait after powering them on (seconds)'],
     ['ENABLE_SHORT_WORKER_HOSTNAMES', 'Rename nodes to worker-<MAC>'],
@@ -1187,7 +1366,8 @@ function editorCards(ctx) {
   add('cluster', CLUSTER_CARD, ['CLUSTER_NAME', 'BASE_DOMAIN', 'API_VIP', 'INGRESS_VIP', 'SKIP_ETC_HOSTS']);
   add('secrets', SECRETS_CARD, ['OPENSHIFT_PULL_SECRET', 'DPF_PULL_SECRET', 'SSH_KEY']);
   add('versions', VERSIONS_CARD, ['OPENSHIFT_VERSION', 'OCP_RELEASE_IMAGE', 'BLUEFIELD_OCP_IMAGE', 'BFB_URL']);
-  add('dpus', DPUS_CARD, ['WORKER_COUNT', 'DPU_HOST_CIDR', 'AUTO_APPROVE_WORKER_CSR', ...ctx.workerSlots().flatMap(n => DPU_FIELDS.map(f => `WORKER_${n}_${f}`))]);
+  add('mode', ZT_CARD, ZT_KEYS);
+  add('dpus', DPUS_CARD, ['WORKER_COUNT', 'DPU_HOST_CIDR', 'AUTO_APPROVE_WORKER_CSR', ...ctx.workerSlots().flatMap(n => [...DPU_FIELDS.map(f => `WORKER_${n}_${f}`), `DPU${n}_BMC_IP`, `DPU${n}_SERIAL`])]);
   add('hbn', HBN_CARD, ['VTEP_CIDR']);
   add('hosted', HOSTED_CARD, ['HOSTED_CLUSTER_NAME', 'CLUSTERS_NAMESPACE', 'HOSTED_CONTROL_PLANE_NAMESPACE', 'HYPERSHIFT_API_IP']);
   if (ctx.ui.advTabs) {

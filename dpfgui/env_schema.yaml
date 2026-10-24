@@ -1,7 +1,7 @@
 # Machine-readable description of the openshift-dpf automation repo's settings
 # (everything `make generate-env` writes to .env).
 #
-# Lives in dpf-dev-gui for now; describes openshift-dpf as of d9e333f (2026-10-06). If the
+# Lives in dpf-dev-gui for now; describes openshift-dpf as of 7086646 (2026-10-18). If the
 # automation repo ships its own ci/env.schema.yaml, the app prefers that one.
 #
 #   parameters     every setting in ci/env.template: what it does, its type,
@@ -46,6 +46,7 @@ groups:
   bridge: Hypervisor bridge
   paths: Repo paths
   dpf: DPF
+  zero-trust: Zero Trust DPUs
   kata: Kata containers
   operators: Operators
   hosted: Hosted (DPU) cluster
@@ -167,6 +168,22 @@ parameters:
     type: path
     default: ~/.ssh/id_ed25519.pub
 
+  DPF_DEPLOYMENT_MODE:
+    description: >-
+      DPF's trust model. host-trusted: the DPU host is trusted; DPF provisions DPUs through it (hostagent,
+      make all). zero-trust: the host is not trusted; DPF provisions each DPU through its own BMC over
+      Redfish and installs with make all-zt.
+    group: zero-trust
+    type: enum
+    values:
+    - host-trusted
+    - zero-trust
+    default: host-trusted
+    common: true
+    notes: >-
+      DPF can't switch an installed cluster between the two: deploymentMode is immutable, so changing it
+      means a fresh deployment. Zero Trust requires NODES_MTU=9000 and HYPERSHIFT_INSTALL_METHOD=binary.
+
   DPF_VERSION:
     description: DPF operator helm chart version.
     group: dpf
@@ -203,7 +220,7 @@ parameters:
       overrides.
     group: dpf
     type: version
-    default: v26.4-ocp-beta4-kata
+    default: v26.4.1-ocp-release-v4.22
 
   OVN_DAEMONSET_VERSION:
     group: dpf
@@ -318,23 +335,13 @@ parameters:
 
   KATA_SRIOV_DP_CONFIG_NAME:
     description: >-
-      Name of the VF pool for Kata pods (the last KATA_NUM_VFS VFs of PF KATA_SRIOV_PF_INDEX). Only used
-      when KATA_ENABLED=true.
+      Name of the VF pool for Kata pods (PF0 VFs 2..KATA_NUM_VFS+1). Only used when KATA_ENABLED=true.
     group: kata
     type: string
-    default: bf3-p1-vfs-kata
-
-  KATA_SRIOV_PF_INDEX:
-    description: PF whose top VFs are carved out for the Kata VF pool when KATA_ENABLED=true.
-    group: kata
-    type: integer
-    default: 1
-    notes: >-
-      Only 1 is consistent: the template always shrinks the PF1 regular range, so other values overlap
-      the PF0 pools.
+    default: bf3-p0-vfs-kata
 
   KATA_NUM_VFS:
-    description: PF1 VFs reserved for Kata; must be less than NUM_VFS.
+    description: PF0 VFs reserved for Kata (VFs 2..KATA_NUM_VFS+1); must be less than NUM_VFS.
     group: kata
     type: integer
     min: 0
@@ -395,6 +402,45 @@ parameters:
     type: integer
     min: 0
     default: 1
+
+  ARGUS_ENABLED:
+    description: Deploy the DOCA Argus DPU service. Reserves 4 CPUs and 10Gi of memory on each DPU.
+    group: dpu-services
+    type: boolean
+    default: false
+
+  ARGUS_CHART_VERSION:
+    description: DOCA Argus chart version (ARGUS_ENABLED=true).
+    group: dpu-services
+    type: version
+    default: 1.5.0
+
+  ARGUS_HELM_REPO_URL:
+    description: Helm repository of the DOCA Argus chart (ARGUS_ENABLED=true).
+    group: dpu-services
+    type: url
+    default_expr: ${DPF_HELM_REPO_URL}
+
+  ARGUS_IMAGE:
+    pulled: ARGUS_ENABLED == true
+    description: DOCA Argus image (ARGUS_ENABLED=true).
+    group: dpu-services
+    type: image
+    default: nvcr.io/nvidia/doca/doca_argus:1.5.0-doca3.5.0
+
+  ARGUS_IMAGE_PULL_SECRET:
+    description: Pull secret the DOCA Argus pods use (ARGUS_ENABLED=true).
+    group: dpu-services
+    type: k8s-name
+    default: dpf-pull-secret
+
+  ARGUS_TELEMETRY_NODE_PORT:
+    description: NodePort of the DOCA Argus telemetry endpoint (ARGUS_ENABLED=true).
+    group: dpu-services
+    type: integer
+    min: 30000
+    max: 32767
+    default: 30224
 
   GITOPS_OPERATOR_CHANNEL:
     description: >-
@@ -742,11 +788,41 @@ parameters:
 
   VM_STATIC_IP:
     description: >-
-      Give the control-plane VMs static IPs instead of DHCP. Needs VM_EXT_IPS, VM_EXT_PL, VM_GW and VM_DNS,
-      which generate-env does not carry over.
+      Give the control-plane VMs static IPs instead of DHCP, from VM_EXT_IPS, VM_EXT_PL, VM_GW and VM_DNS.
     group: vms
     type: boolean
     default: false
+
+  VM_EXT_IPS:
+    description: Comma-separated static IPv4 addresses, one per control-plane VM (VM_STATIC_IP=true).
+    group: vms
+    type: string
+    default: ''
+    required_when: VM_STATIC_IP == true
+    per_environment: true
+
+  VM_EXT_PL:
+    description: Prefix length of the static VM network (VM_STATIC_IP=true).
+    group: vms
+    type: integer
+    min: 1
+    max: 32
+    default: ''
+    required_when: VM_STATIC_IP == true
+
+  VM_GW:
+    description: Default gateway for statically addressed VMs (VM_STATIC_IP=true).
+    group: vms
+    type: ipv4
+    default: ''
+    required_when: VM_STATIC_IP == true
+
+  VM_DNS:
+    description: Comma-separated DNS servers for statically addressed VMs (VM_STATIC_IP=true).
+    group: vms
+    type: string
+    default: ''
+    required_when: VM_STATIC_IP == true
 
   VM_WORKER_COUNT:
     description: >-
@@ -870,6 +946,103 @@ parameters:
     default: lvms-vg1
     deprecated: 'Has no effect: defined but never read.'
 
+  ZT_DPU_DISCOVERY_MODE:
+    description: >-
+      How DPF finds the DPUs (zero-trust only). scanning: a DPUDiscovery scans
+      ZT_DPU_BMC_IP_RANGE_START..END every ZT_DPU_DISCOVERY_SCAN_INTERVAL. static: one DPUDevice and DPUNode
+      per DPU<N>_SERIAL / DPU<N>_BMC_IP.
+    group: zero-trust
+    type: enum
+    values:
+    - scanning
+    - static
+    default: scanning
+    notes: Removing a DPU (make scale-in-zt-dpu) only works with static; scanning would find it again.
+
+  ZT_DPU_BMC_IP_RANGE_START:
+    description: First DPU BMC address the DPUDiscovery scans (zero-trust, scanning).
+    group: zero-trust
+    type: ipv4
+    default: ''
+    required_when: DPF_DEPLOYMENT_MODE == zero-trust and ZT_DPU_DISCOVERY_MODE == scanning
+    per_environment: true
+
+  ZT_DPU_BMC_IP_RANGE_END:
+    description: Last DPU BMC address the DPUDiscovery scans, inclusive (zero-trust, scanning).
+    group: zero-trust
+    type: ipv4
+    default: ''
+    required_when: DPF_DEPLOYMENT_MODE == zero-trust and ZT_DPU_DISCOVERY_MODE == scanning
+    per_environment: true
+
+  ZT_DPU_DISCOVERY_NAME:
+    description: Name of the DPUDiscovery object (zero-trust, scanning).
+    group: zero-trust
+    type: k8s-name
+    default: dpu-discovery
+    required_when: DPF_DEPLOYMENT_MODE == zero-trust and ZT_DPU_DISCOVERY_MODE == scanning
+
+  ZT_DPU_DISCOVERY_SCAN_INTERVAL:
+    description: How often the DPUDiscovery rescans the range, as a Go duration (zero-trust, scanning).
+    group: zero-trust
+    type: string
+    default: 3m
+
+  ZT_DPU_BMC_ROOT_PASSWORD:
+    description: >-
+      Password of the root account on every DPU BMC (zero-trust). All DPU BMCs must share it; DPF logs in
+      as root to provision them over Redfish.
+    group: zero-trust
+    type: string
+    default: ''
+    secret: true
+    required_when: DPF_DEPLOYMENT_MODE == zero-trust
+    per_environment: true
+    notes: >-
+      Set it on each DPU BMC by hand first, and enable rshim there (systemctl enable --now rshim).
+
+  ZT_BFB_REGISTRY_PORT:
+    description: Port the DPU BMCs fetch the BFB from on the management cluster's BFB registry (zero-trust).
+    group: zero-trust
+    type: integer
+    min: 1
+    max: 65535
+    default: 8086
+    required_when: DPF_DEPLOYMENT_MODE == zero-trust
+
+  ZT_DPU_REBOOT_IMAGE:
+    pulled: DPF_DEPLOYMENT_MODE == zero-trust
+    description: >-
+      Image with bash and ipmitool for the DPUNode reboot Job: when a DPU needs its host reset or power
+      cycled, the Job does it through that host's BMC (WORKER_<N>_BMC_*). Zero-trust only.
+    group: zero-trust
+    type: image
+    default: quay.io/rh-ee-sbarak/dpunode-reboot:v0.1.0
+    required_when: DPF_DEPLOYMENT_MODE == zero-trust
+
+  DPU{N}_SERIAL:
+    description: >-
+      Serial number of DPU N, lowercase, as its BMC reports it in /redfish/v1/Systems/Bluefield (zero-trust).
+      DPU N belongs to physical worker N, whose BMC (WORKER_<N>_BMC_*) is used to reboot it.
+    group: zero-trust
+    type: string
+    default: ''
+    instances: [1, 2]
+    per_environment: true
+    notes: >-
+      DPU1_SERIAL is required in zero-trust. Higher numbers than the template's slots are passed through
+      too.
+
+  DPU{N}_BMC_IP:
+    description: >-
+      BMC address of DPU N (zero-trust). Required with ZT_DPU_DISCOVERY_MODE=static; with scanning it must
+      be inside the scanned range.
+    group: zero-trust
+    type: ipv4
+    default: ''
+    instances: [1, 2]
+    per_environment: true
+
   BFB_URL:
     description: >-
       BlueField BFB image the DPUs are flashed with. Required for the dpf profile; should match the hosted
@@ -887,8 +1060,17 @@ parameters:
       RHCOS/OCP layer image the DPUs run (machineOSURL). Must match the hosted cluster's OpenShift version.
     group: hosted
     type: image
-    default: quay.io/edge-infrastructure/bluefield-ocp:4.22.7
+    default: ''
     common: true
+    notes: Empty leaves machineOSURL out, and the provisioner picks the image from BLUEFIELD_OCP_LAYER_REPO.
+
+  BLUEFIELD_OCP_LAYER_REPO:
+    description: >-
+      Repository the DPF HCP provisioner resolves the BlueField OCP layer image from when BLUEFIELD_OCP_IMAGE
+      is empty (DPFHCPProvisionerConfig.spec.blueFieldOCPLayerRepo).
+    group: hosted
+    type: image-repo
+    default: ''
 
   KUBECONFIG:
     description: >-
@@ -914,11 +1096,50 @@ parameters:
     common: true
     per_environment: true
 
+  POWER_OFF_WORKERS:
+    description: Power off the physical workers during make clean-all.
+    group: workers
+    type: boolean
+    default: true
+
   ENABLE_SHORT_WORKER_HOSTNAMES:
     description: Rename every worker node once to worker-<MAC>.
     group: workers
     type: boolean
     default: false
+
+  SIMULATED_DPUS_ONLY:
+    description: >-
+      Every DPU host is a simulated one from dpusimaas: the hosts get a simulated BlueField-3
+      (MachineConfig), DPF's DMS pods the simulated hostdriver, and OVN-Kubernetes on the DPUs
+      --simulate-dpu.
+    group: workers
+    type: boolean
+    default: false
+
+  DPUSIMAAS_URL:
+    description: The dpusimaas the simulated DPU hosts come from (with SIMULATED_DPUS_ONLY).
+    group: workers
+    type: url
+    default: ""
+
+  SIMULATED_DPU_HOSTDRIVER_IMAGE_REPO:
+    description: The simulated hostdriver DPF's DMS pods run instead of NVIDIA's (same tags).
+    group: workers
+    type: string
+    default: quay.io/otuchfel/hostdriver-sim
+
+  SIMULATED_DPU_OVN_CHART_URL:
+    description: OCI registry base of the OVN-Kubernetes chart for simulated DPUs (dpuManifests.simulateDPU).
+    group: workers
+    type: url
+    default: oci://quay.io/otuchfel/charts
+
+  SIMULATED_DPU_OVN_CHART_VERSION:
+    description: Version of the OVN-Kubernetes chart for simulated DPUs.
+    group: workers
+    type: string
+    default: v26.4.1-ocp-release-v4.22-simdpu
 
   WORKER_NODE_LABELS:
     description: Labels applied to the workers.
@@ -928,12 +1149,13 @@ parameters:
 
   WORKER_POWER_ON_DELAY:
     description: >-
-      Seconds to wait after powering on physical workers before provisioning (lets hosts/DPUs settle).
+      Host-trusted: seconds to wait after powering on physical workers before provisioning (lets hosts/DPUs
+      settle). Zero-trust: the longest to wait for every configured DPU's Redfish endpoint to answer.
     group: workers
     type: integer
     unit: s
     min: 0
-    default: 180
+    default: 240
 
   WORKER_{N}_NAME:
     description: >-
@@ -1121,14 +1343,23 @@ parameters:
     group: verification
     type: integer
     min: 1
-    default: 3
+    default: 5
 
   SANITY_TESTS_PING_COUNT:
     description: ICMP echo packets per SR-IOV/HBN sanity ping test.
     group: verification
     type: integer
     min: 1
-    default: 20
+    default: 5
+
+  SANITY_TESTS_PING_MAX_PACKET_LOSS:
+    description: Highest packet loss a sanity ping test may see and still pass.
+    group: verification
+    type: integer
+    unit: '%'
+    min: 0
+    max: 100
+    default: 25
 
   SANITY_TESTS_PING_HBN_TO_HBN_PODS:
     description: >-
@@ -1246,26 +1477,6 @@ not_templated:
     used_in: scripts/env.sh:211
     notes: Required when SKIP_DEPLOY_STORAGE=true.
 
-  VM_EXT_IPS:
-    description: Comma-separated static IPv4 addresses, one per control-plane VM (VM_STATIC_IP=true).
-    type: string
-    used_in: scripts/cluster.sh:113
-
-  VM_EXT_PL:
-    description: Prefix length of the static VM network (VM_STATIC_IP=true).
-    type: integer
-    used_in: scripts/cluster.sh:106
-
-  VM_GW:
-    description: Default gateway for statically addressed VMs (VM_STATIC_IP=true).
-    type: ipv4
-    used_in: scripts/cluster.sh:130
-
-  VM_DNS:
-    description: Comma-separated DNS servers for statically addressed VMs (VM_STATIC_IP=true).
-    type: string
-    used_in: scripts/cluster.sh:135
-
   CNO_HCP_IMAGE:
     description: Overrides the cluster-network-operator image in the hosted control plane.
     type: image
@@ -1310,6 +1521,12 @@ not_templated:
     type: version
     used_in: scripts/upgrade-hosted.sh:202
 removed:
+
+  KATA_SRIOV_PF_INDEX:
+    removed_in: 9e8df65
+    date: 2026-10-12
+    reason: >-
+      The Kata VF pool always takes the low VFs of PF0 now, so there is no PF to choose.
 
   HBN_OVN_NETWORK:
     removed_in: a040a15

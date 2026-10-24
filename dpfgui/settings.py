@@ -17,7 +17,7 @@ import re
 import time
 from pathlib import Path
 
-from . import config, identity, machines, ops, schema as schema_mod, ssh, subnets
+from . import config, identity, machines, ops, schema as schema_mod, simdpus, ssh, subnets
 from .config import Profile
 
 REMOTE_CONFIG = (Path(__file__).parent / "remote_config.py").read_text()
@@ -169,7 +169,7 @@ def cross_rules(eff: dict[str, str], facts: dict, issues: dict[str, list]) -> No
     if sno:
         # Single-node has no VIPs: it answers on its VM's own (DHCP) address
         vip_keys = [k for k in vip_keys if k == "HYPERSHIFT_API_IP"]
-    elif not eff.get("HYPERSHIFT_API_IP"):
+    elif not eff.get("HYPERSHIFT_API_IP") and eff.get("DPF_DEPLOYMENT_MODE") != "zero-trust":
         add("HYPERSHIFT_API_IP", "info", "Empty: the hosted cluster API will be exposed via NodePort instead of a MetalLB IP")
     seen: dict[str, str] = {}
     for k in vip_keys:
@@ -216,8 +216,6 @@ def cross_rules(eff: dict[str, str], facts: dict, issues: dict[str, list]) -> No
         add("SSH_KEY", "error", "Must point to a public key file ending in .pub")
     if eff.get("STORAGE_TYPE") == "odf" and _int(eff.get("VM_COUNT"), 3) < 3:
         add("STORAGE_TYPE", "warn", "ODF needs VM_COUNT ≥ 3; the repo silently falls back to lvm")
-    if eff.get("VM_STATIC_IP") == "true":
-        add("VM_STATIC_IP", "warn", "Needs VM_EXT_IPS, VM_EXT_PL, VM_GW and VM_DNS, which the repo's config generation drops")
     if eff.get("MAC_PREFIX") and not re.fullmatch(r"[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}", eff["MAC_PREFIX"]):
         add("MAC_PREFIX", "error", "Must be two hex bytes like 1a:2b")
 
@@ -275,12 +273,14 @@ def cross_rules(eff: dict[str, str], facts: dict, issues: dict[str, list]) -> No
 
     # Kata
     if eff.get("KATA_ENABLED") == "true" and _int(eff.get("KATA_NUM_VFS")) >= _int(eff.get("NUM_VFS")):
-        add("KATA_NUM_VFS", "error", "Must be smaller than NUM_VFS (the rest of PF1's VFs form the regular pool)")
+        add("KATA_NUM_VFS", "error", "Must be smaller than NUM_VFS (the rest of PF0's VFs form the regular pool)")
 
-    # Physical workers
+    # Physical workers. Zero Trust never installs them (no boot NIC needed), only powers them on and
+    # resets them through their BMCs.
     wc = _int(eff.get("WORKER_COUNT"))
+    zt = eff.get("DPF_DEPLOYMENT_MODE") == "zero-trust"
     for i in range(1, wc + 1):
-        for field in ("NAME", "BMC_IP", "BMC_USER", "BMC_PASSWORD", "BOOT_MAC"):
+        for field in ("NAME", "BMC_IP", "BMC_USER", "BMC_PASSWORD") + (() if zt else ("BOOT_MAC",)):
             k = f"WORKER_{i}_{field}"
             if not eff.get(k):
                 if k in eff:
@@ -288,6 +288,114 @@ def cross_rules(eff: dict[str, str], facts: dict, issues: dict[str, list]) -> No
                 else:
                     add("WORKER_COUNT", "error", f"WORKER_COUNT={wc} but the repo template has no slot for {k}")
     lab_machines(eff, wc, facts, add)
+    zero_trust_rules(eff, wc, add)
+    simulated_dpu_rules(eff, wc, add)
+
+
+def simulated_dpu_rules(eff: dict, wc: int, add) -> None:
+    """A deployment's DPU hosts are all simulated (dpusimaas leases, SIMULATED_DPUS_ONLY) or all real."""
+    names = [eff.get(f"WORKER_{i}_NAME", "") for i in range(1, wc + 1)]
+    sims = [n for n in names if re.fullmatch(r"sim-[0-9a-f]+", n)]
+    real = [n for n in names if n and n not in sims]
+    only = eff.get("SIMULATED_DPUS_ONLY") == "true"
+    if sims and real:
+        add("WORKER_COUNT", "error", f"Simulated ({', '.join(sims)}) and real ({', '.join(real)}) DPU hosts can't be "
+            "deployed together: remove one kind")
+    elif sims and not only:
+        add("SIMULATED_DPUS_ONLY", "error", "Required with simulated DPU hosts",
+            {"op": "set", "key": "SIMULATED_DPUS_ONLY", "value": "true", "label": "Turn on"})
+    elif real and only:
+        add("SIMULATED_DPUS_ONLY", "error", "Only for simulated DPU hosts; this profile's are real",
+            {"op": "set", "key": "SIMULATED_DPUS_ONLY", "value": "false", "label": "Turn off"})
+    if only and not eff.get("DPUSIMAAS_URL"):
+        add("DPUSIMAAS_URL", "error", "Required with SIMULATED_DPUS_ONLY",
+            {"op": "set", "key": "DPUSIMAAS_URL", "value": simdpus.URL, "label": f"Use {simdpus.URL}"})
+
+
+DPU_SERIAL_RE = re.compile(r"^DPU(\d+)_SERIAL$")
+DPU_BMC_RE = re.compile(r"^DPU(\d+)_BMC_IP$")
+
+
+def zero_trust_rules(eff: dict, wc: int, add) -> None:
+    """What `make all-zt` (validate_zero_trust_mode in the repo's scripts/env.sh) insists on, said on
+    the setting it's about, plus what it can't check: every DPU host has its DPU's serial, and a DPU's
+    BMC is inside the scanned range."""
+    if eff.get("DPF_DEPLOYMENT_MODE") != "zero-trust":
+        return
+    if eff.get("NODES_MTU") != "9000":
+        add("NODES_MTU", "error", "Zero Trust needs 9000: make all-zt installs with NODES_MTU=9000 whatever this says",
+            {"op": "set", "key": "NODES_MTU", "value": "9000", "label": "Set 9000"})
+    if eff.get("HYPERSHIFT_INSTALL_METHOD") != "binary":
+        add("HYPERSHIFT_INSTALL_METHOD", "error", "Zero Trust installs HyperShift with the hypershift CLI only",
+            {"op": "set", "key": "HYPERSHIFT_INSTALL_METHOD", "value": "binary", "label": "Use the hypershift CLI"})
+    for k, what in (("ZT_DPU_BMC_ROOT_PASSWORD", "the root password of the DPU BMCs (a simulated DPU brings one)"), ("ZT_BFB_REGISTRY_PORT", "the BFB registry port"),
+                    ("ZT_DPU_REBOOT_IMAGE", "the image that resets hosts through their BMCs"), ("BFB_URL", "the BFB the DPUs are flashed with")):
+        if not eff.get(k):
+            add(k, "todo", f"Required in Zero Trust: {what}")
+    vm_count = _int(eff.get("VM_COUNT"), 3)
+    if vm_count > 1 and not eff.get("HYPERSHIFT_API_IP"):
+        add("HYPERSHIFT_API_IP", "todo", "Required in multi-node Zero Trust: the DPU BMCs fetch the BFB from the registry at this MetalLB address")
+    elif vm_count == 1 and eff.get("HYPERSHIFT_API_IP"):
+        add("HYPERSHIFT_API_IP", "info", "Ignored on a single node: Zero Trust exposes the hosted API on the node's own address")
+
+    mode = eff.get("ZT_DPU_DISCOVERY_MODE")
+    serials = {int(m.group(1)): v for k, v in eff.items() if (m := DPU_SERIAL_RE.match(k)) and v}
+    if not serials.get(1):
+        add("DPU1_SERIAL", "todo", "Required in Zero Trust: pick a DPU host or lease a simulated one")
+    seen: dict[str, int] = {}
+    for n, serial in sorted(serials.items()):
+        k = f"DPU{n}_SERIAL"
+        if serial != serial.lower():
+            add(k, "error", "Must be lowercase", {"op": "set", "key": k, "value": serial.lower(), "label": f"Use {serial.lower()}"})
+        if not re.fullmatch(r"[0-9a-zA-Z]+", serial):
+            add(k, "error", "A BlueField serial is letters and digits only, like mt2536600emj")
+        if serial.lower() in seen:
+            add(k, "error", f"Same serial as DPU{seen[serial.lower()]}_SERIAL")
+        seen.setdefault(serial.lower(), n)
+        if n > wc:
+            add(k, "error", f"DPU {n} belongs to physical worker {n}, but WORKER_COUNT={wc}: its host can't be reset")
+        elif (eff.get(f"WORKER_{n}_DPU") or ("false" if eff.get("DEPLOYMENT_PROFILE") == "nno" else "true")) != "true":
+            add(k, "error", f"Worker {n} is set as having no DPU (WORKER_{n}_DPU)")
+    for n in range(1, wc + 1):
+        if not serials.get(n) and f"DPU{n}_SERIAL" in eff and n > 1:
+            add(f"DPU{n}_SERIAL", "todo", f"Required: worker {n}'s DPU, or DPF can't pair it with its host")
+
+    with_ip = {int(m.group(1)) for k in eff if (m := DPU_BMC_RE.match(k))}
+    bmcs = {n: eff.get(f"DPU{n}_BMC_IP") or "" for n in set(serials) | with_ip}
+    seen_ip: dict[str, int] = {}
+    for n, ip in sorted(bmcs.items()):
+        k = f"DPU{n}_BMC_IP"
+        if ip and not serials.get(n):
+            add(k, "error", f"Needs DPU{n}_SERIAL")
+        if ip and ip in seen_ip:
+            add(k, "error", f"Same address as DPU{seen_ip[ip]}_BMC_IP")
+        seen_ip.setdefault(ip, n)
+    sims = [n for n in serials if re.fullmatch(r"sim-[0-9a-f]+", eff.get(f"WORKER_{n}_NAME", ""))]
+    if sims and mode == "scanning":
+        add("ZT_DPU_DISCOVERY_MODE", "error", "Simulated DPUs get their BMC addresses from DHCP, all over the LAN: a range around "
+            "them would have DPF log in to other people's BMCs. List them instead",
+            {"op": "set", "key": "ZT_DPU_DISCOVERY_MODE", "value": "static", "label": "Use static"})
+    if mode == "static":
+        for n in serials:
+            if not bmcs.get(n):
+                add(f"DPU{n}_BMC_IP", "todo", "Required with static discovery")
+    elif mode == "scanning":
+        lo, hi = _ip(eff.get("ZT_DPU_BMC_IP_RANGE_START")), _ip(eff.get("ZT_DPU_BMC_IP_RANGE_END"))
+        for k, v in (("ZT_DPU_BMC_IP_RANGE_START", lo), ("ZT_DPU_BMC_IP_RANGE_END", hi)):
+            if not eff.get(k):
+                add(k, "todo", "Required with scanning discovery")
+        if not eff.get("ZT_DPU_DISCOVERY_NAME"):
+            add("ZT_DPU_DISCOVERY_NAME", "todo", "Required with scanning discovery")
+        if lo and hi and lo > hi:
+            add("ZT_DPU_BMC_IP_RANGE_END", "error", f"Before the start of the range ({lo})")
+        elif lo and hi:
+            size = int(hi) - int(lo) + 1
+            if size > 1024:
+                add("ZT_DPU_BMC_IP_RANGE_END", "warn", f"{size} addresses: DPF logs in to every one of them every scan")
+            for n, ip in sorted(bmcs.items()):
+                a = _ip(ip)
+                if a and not lo <= a <= hi:
+                    add(f"DPU{n}_BMC_IP", "error", f"Outside the scanned range {lo}–{hi}, so DPF won't find this DPU")
 
 
 def lab_machines(eff: dict, wc: int, facts: dict, add) -> None:

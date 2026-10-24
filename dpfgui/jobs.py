@@ -36,7 +36,7 @@ STAGES: dict[str, str] = {
     "clean-vms": "Destroy VMs",
     "clean-cluster": "Delete cluster & generated files",
     "config": "Push user.env & generate .env",
-    "install": "make all",
+    "install": "make all (all-zt for Zero Trust)",
 }
 STAGE_ORDER = list(STAGES)
 OWNER_FILE = ".git/dpf-dev-owner.json"  # in the clone (see config.clone_conflict)
@@ -119,9 +119,12 @@ git log -1 --format='Now at %h  %s  (%cr)'
     if stage == "config":
         return "push_env"
     if stage == "install":
+        # Zero Trust installs with its own target (and its own list of steps).
         return r"""
-echo "::dpfgui::steps $(make -s --no-print-directory --eval '__dpfgui_steps: ; @echo $(ALL_STEPS)' __dpfgui_steps 2>/dev/null)"
-make --debug=b all
+if [ "$(sed -n 's/^DPF_DEPLOYMENT_MODE=//p' .env | tail -1)" = zero-trust ]; then target=all-zt steps=ZT_ALL_STEPS; else target=all steps=ALL_STEPS; fi
+echo "::dpfgui::steps $(make -s --no-print-directory --eval "__dpfgui_steps: ; @echo \$($steps)" __dpfgui_steps 2>/dev/null)"
+echo "Running make $target"
+make --debug=b "$target"
 """
     raise JobError(f"unknown stage {stage}")
 

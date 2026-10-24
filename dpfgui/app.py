@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import re
+import secrets
 import shlex
 import time
 import urllib.error
@@ -19,7 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import config, dns, github, identity, jobs, k8s, kubeconfigs, machines, ops, schema as schema_mod, settings, ssh, subnets
+from . import config, dns, github, identity, jobs, k8s, kubeconfigs, machines, ops, schema as schema_mod, settings, simdpus, ssh, subnets
 from .config import ConfigError, Profile
 
 STATIC = Path(__file__).parent / "static"
@@ -331,6 +332,23 @@ async def bmc_probe(request: Request, name: str, body: BmcProbeIn):
     return await _cached(key, 600, fetch)
 
 
+class DpuBmcProbeIn(BaseModel):
+    bmc: str
+    password: str
+
+
+@app.post("/api/profiles/{name}/dpu-bmc-probe")
+async def dpu_bmc_probe(request: Request, name: str, body: DpuBmcProbeIn):
+    """Zero Trust: a DPU's serial and rshim state from its own BMC, which also checks root's password."""
+    p = _draft(name, request)
+
+    async def fetch():
+        return await ops.dpu_bmc_probe(p, body.bmc, body.password)
+
+    key = ("dpu-bmc", p.host, body.bmc, hashlib.sha256(body.password.encode()).hexdigest())
+    return await _cached(key, 600, fetch)
+
+
 @app.get("/api/bfb-files")
 async def bfb_files(url: str):
     """The .bfb files next to a BFB URL, when its server offers a directory listing."""
@@ -446,6 +464,100 @@ async def change_dpus(name: str, body: DpuIn):
     elif body.remove:
         ops.remove_dpu(name, s, lab, str(body.remove))
     return {"settings": s, "remembered": machines.remembered()}
+
+
+# ── Simulated DPUs (dpusimaas) ───────────────────────────────────────────────
+
+
+def _sim_owner() -> str:
+    me = identity.me()
+    if not me:
+        raise HTTPException(400, "Say who you are first (your GitHub login): simulated DPUs are leased to you")
+    return me[0]
+
+
+@app.get("/api/sim-dpus")
+async def sim_dpus():
+    """Your simulated DPU leases, and how many dpusimaas has room for."""
+    me = identity.me()
+    try:
+        inf = await asyncio.to_thread(simdpus.info)
+        leases = await asyncio.to_thread(simdpus.leases, me[0]) if me else []
+    except simdpus.SimError as e:
+        return {"url": simdpus.URL, "error": str(e), "leases": []}
+    return {"url": simdpus.URL, "info": inf, "leases": leases}
+
+
+class SimDpuIn(BaseModel):
+    settings: dict
+    slots: list[int] = []
+    lease_id: str | None = None  # one of your leases to use; none = lease a new one
+
+
+@app.post("/api/profiles/{name}/sim-dpus")
+async def lease_sim_dpu(name: str, body: SimDpuIn):
+    """Lease a simulated DPU host and give it the next worker slot of the (unsaved) draft."""
+    _profile(name)
+    owner = _sim_owner()
+    s = config.normalize_settings(body.settings)
+    vals = ops.values(name, s)
+    mode = "zero-trust" if vals.get("DPF_DEPLOYMENT_MODE") == "zero-trust" else "host-trusted"
+    real = [w["name"] for w in ops.selected_workers(vals, {}) if not re.fullmatch(r"sim-[0-9a-f]+", w["name"] or "")]
+    if real:
+        raise HTTPException(400, f"This profile's DPU hosts are real ({', '.join(real)}): a deployment's are all "
+                                 "simulated or all real")
+    # Every DPU BMC of a deployment shares one root password. A simulated BMC takes any, so a new
+    # lease gets the profile's, or the profile gets a new one.
+    password = vals.get("ZT_DPU_BMC_ROOT_PASSWORD") or ("Sim" + secrets.token_hex(6))
+    try:
+        if body.lease_id:
+            lease = next((l for l in await asyncio.to_thread(simdpus.leases, owner) if l["id"] == body.lease_id), None)
+            if not lease:
+                raise HTTPException(404, f"{body.lease_id} isn't one of your simulated DPUs")
+            if lease["mode"] != mode:
+                raise HTTPException(400, f"{body.lease_id} is a {lease['mode']} DPU host, and this profile deploys {mode}")
+            # A simulated DPU BMC takes any password, so the profile's works with an older lease too.
+        else:
+            lease = await asyncio.to_thread(simdpus.lease, owner, mode, password)
+    except simdpus.SimError as e:
+        raise HTTPException(502, str(e))
+    before = ops.values(name, s)
+    try:
+        n = ops.add_sim_dpu(name, s, lease, slots=body.slots or None)
+    except ops.OpsError:
+        if not body.lease_id:
+            await asyncio.to_thread(simdpus.release, lease["id"])
+        raise
+    # What a simulated DPU brings besides its slot: the simulated-DPU deployment (SIMULATED_DPUS_ONLY);
+    # in Zero Trust, the BMC password and static discovery (its address comes from DHCP, so a scanned
+    # range around it would reach other people's BMCs).
+    extra = {}
+    if before.get("SIMULATED_DPUS_ONLY") != "true":
+        extra["SIMULATED_DPUS_ONLY"] = "true"
+    if not before.get("DPUSIMAAS_URL"):
+        extra["DPUSIMAAS_URL"] = simdpus.URL
+    if mode == "zero-trust" and not before.get("ZT_DPU_BMC_ROOT_PASSWORD"):
+        extra["ZT_DPU_BMC_ROOT_PASSWORD"] = password
+    if mode == "zero-trust" and before.get("ZT_DPU_DISCOVERY_MODE", "scanning") != "static":
+        extra["ZT_DPU_DISCOVERY_MODE"] = "static"
+    ops.set_values(s, extra)
+    after = ops.values(name, s)
+    changed = sorted(k for k in after if after.get(k) != before.get(k) and not k.endswith("PASSWORD")) + sorted(k for k in extra if k.endswith("PASSWORD"))
+    return {"settings": s, "lease": lease, "worker": n, "changed": changed}
+
+
+@app.delete("/api/sim-dpus/{lease_id}")
+async def release_sim_dpu(lease_id: str):
+    """End a lease: its DPU VM, host VM and BMCs go away."""
+    owner = _sim_owner()
+    try:
+        mine = {l["id"] for l in await asyncio.to_thread(simdpus.leases, owner)}
+        if lease_id not in mine:
+            raise HTTPException(404, f"{lease_id} isn't one of your simulated DPUs")
+        await asyncio.to_thread(simdpus.release, lease_id)
+    except simdpus.SimError as e:
+        raise HTTPException(502, str(e))
+    return {"ok": True}
 
 
 # ── Status ───────────────────────────────────────────────────────────────────

@@ -1221,7 +1221,7 @@ function renderPlanner(d, lastJob) {
   const rows = [
     ['pull', 'Pull the repo', 'git pull'],
     ['clean', 'Clean up', 'make clean-all'],
-    ['install', 'Install', 'make all'],
+    ['install', 'Install', S.analysis?.[S.cur]?.rows?.find(r => r.key === 'DPF_DEPLOYMENT_MODE')?.effective === 'zero-trust' ? 'make all-zt' : 'make all'],
     ['kube', 'Fetch kubeconfigs', ''],
   ];
   const kubeImpossible = !plan.install && !kubeState(d).onHost;

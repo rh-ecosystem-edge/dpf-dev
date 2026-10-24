@@ -20,17 +20,25 @@ import shlex
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import config, identity, machines, schema as schema_mod, ssh
+from . import config, identity, machines, schema as schema_mod, simdpus, ssh
 from .config import Profile, Settings
 
 _HERE = Path(__file__).parent
 REMOTE_STATUS = (_HERE / "remote_status.py").read_text()
 REMOTE_FREEIPS = (_HERE / "remote_freeips.py").read_text()
 REMOTE_BMC = (_HERE / "remote_bmc.py").read_text()
+REMOTE_DPU_BMC = (_HERE / "remote_dpu_bmc.py").read_text()
 
 WORKER_RE = re.compile(r"^WORKER_(\d+)_([A-Z_]+)$")
 # Worker fields that belong to the machine (not in the lab list), restored when you pick it again.
 DPU_REMEMBERED = machines.REMEMBERED_FIELDS
+# Zero Trust: DPU<n>_<field> belongs to worker n (its host is reset through WORKER_<n>_BMC_*).
+ZT_DPU_FIELDS = ("SERIAL", "BMC_IP")
+
+
+def slot_key(n: int, field: str) -> str:
+    """The setting holding a remembered field of worker n: DPU_SERIAL → DPU<n>_SERIAL, BOOT_MAC → WORKER_<n>_BOOT_MAC."""
+    return f"DPU{n}_{field[4:]}" if field.startswith("DPU_") else f"WORKER_{n}_{field}"
 DPU_FIELDS = ("NAME", "BMC_IP", "BMC_USER", "BMC_PASSWORD", "BOOT_MAC", "ROOT_DEVICE", "DPU", "REDFISH_SYSTEM_PATH")
 
 
@@ -183,6 +191,19 @@ async def bmc_probe(p: Profile, bmc: str, user: str, password: str, host: str = 
     return d
 
 
+async def dpu_bmc_probe(p: Profile, bmc: str, password: str) -> dict:
+    """What Zero Trust needs from a DPU's own BMC: does root's password work, the DPU's serial
+    (lowercase, as DPU<N>_SERIAL wants it) and whether rshim runs there. {auth, serial, model, rshim, error?}"""
+    if not re.fullmatch(r"[\w.\-:\[\]]+", bmc):
+        raise OpsError("Not a host name")
+    args = base64.b64encode(json.dumps({"bmc": bmc, "password": password}).encode()).decode()
+    r = (await ssh.run(p, REMOTE_DPU_BMC.replace("__ARGS__", args), interp=("python3", "-"), timeout=120)).check("Asking the DPU BMC")
+    d = json.loads(r.out)
+    if d.get("serial"):
+        d["serial"] = d["serial"].lower()
+    return d
+
+
 # ── Editing settings ─────────────────────────────────────────────────────────
 
 
@@ -263,7 +284,7 @@ def find_dpu(lab: dict, what: str) -> dict:
 def remember_worker(name: str, vals: dict, n: int, lab: dict) -> None:
     """Keep the machine's own values (login, boot NIC, ...) for when it's picked again."""
     m = machines.find_worker(lab, vals.get(f"WORKER_{n}_NAME"), vals.get(f"WORKER_{n}_BMC_IP"))
-    own = {f: vals.get(f"WORKER_{n}_{f}") for f in DPU_REMEMBERED}
+    own = {f: vals.get(slot_key(n, f)) for f in DPU_REMEMBERED}
     if m:
         machines.remember(m["id"], own, config.get_profile(name).title or name)
 
@@ -293,7 +314,7 @@ def add_dpu(name: str, s: Settings, lab: dict, machine: str, *, force: bool = Fa
     slots = slots or worker_slots()
     if n not in slots:
         raise OpsError(f"The automation repo only has slots for {len(slots)} DPU hosts")
-    k = lambda f: f"WORKER_{n}_{f}"  # noqa: E731
+    k = lambda f: slot_key(n, f)  # noqa: E731
     known = {**(machines.remembered().get(m["id"]) or {}), **(m.get("worker") or {})}
     # What we don't know about this machine starts at the repo default.
     reset(s, *(k(f) for f in DPU_REMEMBERED if not known.get(f)))
@@ -302,6 +323,32 @@ def add_dpu(name: str, s: Settings, lab: dict, machine: str, *, force: bool = Fa
     # No guessed passwords: the user starts as root, the password is yours to give.
     new.setdefault(k("BMC_USER"), "root")
     set_values(s, new)
+    return n
+
+
+def add_sim_dpu(name: str, s: Settings, lease: dict, *, slots: list[int] | None = None) -> int:
+    """Give a simulated DPU host (a dpusimaas lease) the next worker slot: its host BMC, and its DPU's
+    serial and BMC for Zero Trust, or the host the cluster installs for host-trusted. Returns its
+    worker number."""
+    vals = values(name, s)
+    node = simdpus.node_name(lease["id"])
+    if any(vals.get(f"WORKER_{w['n']}_NAME") == node for w in selected_workers(vals, {})):
+        raise OpsError(f"{node} is already one of this profile's DPU hosts")
+    n = worker_count(vals) + 1
+    slots = slots or worker_slots()
+    if n not in slots:
+        raise OpsError(f"The automation repo only has slots for {len(slots)} DPU hosts")
+    reset(s, *(f"WORKER_{n}_{f}" for f in DPU_FIELDS))
+    worker = {
+        f"WORKER_{n}_NAME": node, f"WORKER_{n}_BMC_IP": lease["ip"],
+        f"WORKER_{n}_BMC_USER": lease["ipmi_user"], f"WORKER_{n}_BMC_PASSWORD": lease["ipmi_password"],
+        "WORKER_COUNT": str(n),
+    }
+    if host := lease.get("host"):
+        worker |= {f"WORKER_{n}_BOOT_MAC": host["boot_mac"], f"WORKER_{n}_ROOT_DEVICE": host["root_device"]}
+    else:
+        worker |= {f"DPU{n}_SERIAL": lease["serial"].lower(), f"DPU{n}_BMC_IP": lease["ip"]}
+    set_values(s, worker)
     return n
 
 
@@ -316,7 +363,8 @@ def remove_dpu(name: str, s: Settings, lab: dict, which: str) -> tuple[int, str]
         raise OpsError(f"{which} isn't one of this profile's DPU hosts")
     n, count = w["n"], len(sel)
     remember_worker(name, vals, n, lab)
-    move(s, [(f"WORKER_{i + 1}_{f}", f"WORKER_{i}_{f}") for i in range(n, count + 1) for f in DPU_FIELDS])
+    move(s, [(f"WORKER_{i + 1}_{f}", f"WORKER_{i}_{f}") for i in range(n, count + 1) for f in DPU_FIELDS]
+         + [(f"DPU{i + 1}_{f}", f"DPU{i}_{f}") for i in range(n, count + 1) for f in ZT_DPU_FIELDS])
     if count - 1:
         set_values(s, {"WORKER_COUNT": str(count - 1)})
     else:
