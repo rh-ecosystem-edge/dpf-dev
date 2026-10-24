@@ -9,6 +9,8 @@ import shlex
 import time
 from pathlib import Path
 
+import yaml
+
 from . import config, ssh
 from .config import Profile
 
@@ -48,6 +50,62 @@ def path(name: str, kind: str) -> Path:
     return config.kubeconfig_dir(name) / f"{kind}.kubeconfig"
 
 
+def combined_path(name: str) -> Path:
+    return config.kubeconfig_dir(name) / "all.kubeconfig"
+
+
+def _combined_kinds(name: str) -> list[str]:
+    """What goes in the combined kubeconfig, its current context first.
+    The noingress one only matters until the full one is here."""
+    have = [k for k in ("mgmt", "mgmt-noingress", "hcp") if path(name, k).exists()]
+    return [k for k in have if k != "mgmt-noingress" or "mgmt" not in have]
+
+
+def _write_combined(name: str) -> None:
+    """One kubeconfig with a context for each of the profile's, named <profile>-<kind> (and so
+    are its cluster and user), so it can sit next to other kubeconfigs in $KUBECONFIG."""
+    clusters, users, contexts = [], [], []
+    for kind in _combined_kinds(name):
+        try:
+            kc = yaml.safe_load(path(name, kind).read_text()) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+        by = lambda key: {x.get("name"): x.get(key[:-1]) or {} for x in kc.get(key) or []}  # noqa: E731
+        ctx = by("contexts").get(kc.get("current-context")) or next(iter(by("contexts").values()), {})
+        cluster = by("clusters").get(ctx.get("cluster")) or next(iter(by("clusters").values()), None)
+        user = by("users").get(ctx.get("user")) or next(iter(by("users").values()), None)
+        if not cluster or not user:
+            continue
+        n = f"{name}-{kind}"
+        clusters.append({"name": n, "cluster": cluster})
+        users.append({"name": n, "user": user})
+        contexts.append({"name": n, "context": {"cluster": n, "user": n, **({"namespace": ctx["namespace"]} if ctx.get("namespace") else {})}})
+    f = combined_path(name)
+    if not contexts:
+        f.unlink(missing_ok=True)
+        return
+    text = yaml.safe_dump({"apiVersion": "v1", "kind": "Config", "current-context": contexts[0]["name"],
+                           "clusters": clusters, "users": users, "contexts": contexts},
+                          sort_keys=False, width=100000)
+    tmp = f.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, f)
+
+
+def _combined_info(name: str) -> dict:
+    f = combined_path(name)
+    kinds = _combined_kinds(name)
+    # Kubeconfigs fetched before there was a combined one
+    if kinds and (not f.exists() or f.stat().st_mtime < max(path(name, k).stat().st_mtime for k in kinds)):
+        _write_combined(name)
+    entry = {"label": "All in one", "path": str(f), "exists": f.exists()}
+    if f.exists():
+        entry["contexts"] = [f"{name}-{k}" for k in kinds]
+    return entry
+
+
 def _meta_path(name: str) -> Path:
     d = config.state_dir() / "kubeconfigs"
     d.mkdir(exist_ok=True, mode=0o700)
@@ -84,6 +142,7 @@ def local_info(name: str) -> dict:
             entry["server"] = server_of(f.read_text())
         entry["error"] = meta.get("errors", {}).get(kind)
         out[kind] = entry
+    out["all"] = _combined_info(name)
     out["auto"] = {k: meta.get(k) for k in ("auto_job", "auto_at")}
     out["ai"] = meta.get("ai")
     return out
@@ -91,6 +150,7 @@ def local_info(name: str) -> dict:
 
 def forget(name: str, kind: str) -> None:
     path(name, kind).unlink(missing_ok=True)
+    _write_combined(name)
     meta = load_meta(name)
     meta.get("errors", {}).pop(kind, None)
     save_meta(name, meta)
@@ -101,6 +161,7 @@ def forget_cluster(name: str, job: str) -> None:
     said about it are history."""
     for kind in KINDS:
         path(name, kind).unlink(missing_ok=True)
+    combined_path(name).unlink(missing_ok=True)
     meta = load_meta(name)
     for k in ("ai", "errors", "auto_job", "auto_at"):
         meta.pop(k, None)
@@ -117,6 +178,7 @@ def _write(name: str, kind: str, text: str) -> None:
     with os.fdopen(fd, "w") as fh:
         fh.write(text)
     os.replace(tmp, f)
+    _write_combined(name)
 
 
 def _remote_kubeconfig_script(p: Profile) -> str:

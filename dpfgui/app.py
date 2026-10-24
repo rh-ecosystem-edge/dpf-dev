@@ -509,6 +509,7 @@ async def lease_sim_dpu(name: str, body: SimDpuIn):
     # Every DPU BMC of a deployment shares one root password. A simulated BMC takes any, so a new
     # lease gets the profile's, or the profile gets a new one.
     password = vals.get("ZT_DPU_BMC_ROOT_PASSWORD") or ("Sim" + secrets.token_hex(6))
+    cluster = vals.get("CLUSTER_NAME", "")
     try:
         if body.lease_id:
             lease = next((l for l in await asyncio.to_thread(simdpus.leases, owner) if l["id"] == body.lease_id), None)
@@ -516,9 +517,11 @@ async def lease_sim_dpu(name: str, body: SimDpuIn):
                 raise HTTPException(404, f"{body.lease_id} isn't one of your simulated DPUs")
             if lease["mode"] != mode:
                 raise HTTPException(400, f"{body.lease_id} is a {lease['mode']} DPU host, and this profile deploys {mode}")
+            if cluster and lease.get("cluster") not in (cluster, None):
+                raise HTTPException(400, f"{body.lease_id} is cabled to {lease['cluster']}'s leaf, not {cluster}'s")
             # A simulated DPU BMC takes any password, so the profile's works with an older lease too.
         else:
-            lease = await asyncio.to_thread(simdpus.lease, owner, mode, password)
+            lease = await asyncio.to_thread(simdpus.lease, owner, mode, password, cluster)
     except simdpus.SimError as e:
         raise HTTPException(502, str(e))
     before = ops.values(name, s)
@@ -528,14 +531,16 @@ async def lease_sim_dpu(name: str, body: SimDpuIn):
         if not body.lease_id:
             await asyncio.to_thread(simdpus.release, lease["id"])
         raise
-    # What a simulated DPU brings besides its slot: the simulated-DPU deployment (SIMULATED_DPUS_ONLY);
-    # in Zero Trust, the BMC password and static discovery (its address comes from DHCP, so a scanned
+    # What a simulated DPU brings besides its slot: the simulated-DPU deployment (SIMULATED_DPUS_ONLY),
+    # host-trusted at MTU 1500 (its traffic leaves through the lab LAN); in Zero Trust, the BMC password and static discovery (its address comes from DHCP, so a scanned
     # range around it would reach other people's BMCs).
     extra = {}
     if before.get("SIMULATED_DPUS_ONLY") != "true":
         extra["SIMULATED_DPUS_ONLY"] = "true"
     if not before.get("DPUSIMAAS_URL"):
         extra["DPUSIMAAS_URL"] = simdpus.URL
+    if mode == "host-trusted" and before.get("NODES_MTU", "1500") != "1500":
+        extra["NODES_MTU"] = "1500"
     if mode == "zero-trust" and not before.get("ZT_DPU_BMC_ROOT_PASSWORD"):
         extra["ZT_DPU_BMC_ROOT_PASSWORD"] = password
     if mode == "zero-trust" and before.get("ZT_DPU_DISCOVERY_MODE", "scanning") != "static":
@@ -972,7 +977,7 @@ async def forget_kubeconfig(name: str, kind: str):
 async def download_kubeconfig(name: str, kind: str):
     _profile(name)
     try:
-        f = kubeconfigs.path(name, kind)
+        f = kubeconfigs.combined_path(name) if kind == "all" else kubeconfigs.path(name, kind)
     except KeyError:
         raise HTTPException(404)
     if not f.exists():

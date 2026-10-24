@@ -194,6 +194,8 @@ def cmd_profile_show(a) -> None:
     have = [k for k in kubeconfigs.KINDS if kc[k]["exists"]]
     for j, k in enumerate(have):
         print(f"  {'Kubeconfigs' if j == 0 else '':<13}{kc[k]['path']} {dim('(' + ago(kc[k].get('fetched_at')) + ')')}")
+    if kc["all"]["exists"]:
+        print(f"  {'':<13}{kc['all']['path']} {dim('(contexts: ' + ', '.join(kc['all']['contexts']) + ')')}")
     print_settings(s)
 
 
@@ -954,6 +956,8 @@ async def print_fetch(p: Profile, results: dict) -> None:
     info = kubeconfigs.local_info(p.name)
     for k, r in results.items():
         print(f"  {green('✓')} {info[k]['path']}" if r["ok"] else f"  {red('✗')} {kubeconfigs.KINDS[k]}: {r['error']}")
+    if any(r["ok"] for r in results.values()) and info["all"]["exists"]:
+        print(f"  {green('✓')} {info['all']['path']} {dim('(contexts: ' + ', '.join(info['all']['contexts']) + ')')}")
 
 
 async def fetch_kubeconfigs(p: Profile, kinds: list[str]) -> None:
@@ -995,6 +999,8 @@ async def cmd_kubeconfigs(a) -> None:
         e = info[k]
         state = f"{e['server']}  {dim(ago(e.get('fetched_at')))}" if e["exists"] else dim("not fetched")
         print(f"{k:<15}{e['path']}  {state}" + (f"  {red(e['error']['message'])}" if e.get("error") else ""))
+    if info["all"]["exists"]:
+        print(f"{'all':<15}{info['all']['path']}  {dim('contexts: ' + ', '.join(info['all']['contexts']))}")
 
 
 class _NotCancelled(logging.Filter):

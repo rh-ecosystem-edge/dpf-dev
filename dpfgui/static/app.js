@@ -1386,10 +1386,11 @@ function renderKube() {
     if (!ks.up) return { ok: false, why: 'The management cluster’s VMs aren’t running' };
     return { ok: true };
   };
+  const isStale = kind => kc[kind]?.exists && !ks.onHost && !(mgmtKind(kind) && (ks.aiLive || ks.installing));
   const entry = kind => {
     const k = kc[kind] || {};
     const a = avail(kind);
-    const stale = k.exists && !ks.onHost && !(mgmtKind(kind) && (ks.aiLive || ks.installing));
+    const stale = isStale(kind);
     // The hosted cluster's comes from the repo's copy of the management kubeconfig; a newer copy means a reinstall.
     const outdated = kind === 'hcp' && k.exists && ks.onHost && k.fetched_at < ks.hostMtime;
     const fetching = (busy && busy.includes(kind)) || (auto && a.ok);
@@ -1418,10 +1419,18 @@ function renderKube() {
       ${note ? `<div class="small muted">${esc(note)}</div>` : ''}${failed ? `<div class="small" style="color:var(--bad)">${esc(k.error.message)}</div>` : ''}
     </div>`;
   };
+  // The same ones in one file, a context each
+  const all = kc.all || {};
+  const combined = all.exists && all.contexts?.length > 1 && !KINDS.some(isStale) ? `<div class="kc-line">
+      <div class="kc-row"><b>${esc(all.label)}</b><span class="spacer"></span>
+        <button class="btn small" data-copy="export KUBECONFIG=${esc(all.path)}" title="Copy: export KUBECONFIG=${esc(all.path)}">${icon('copy', 'sm')}export</button>
+        <a class="icon-btn" href="/api/profiles/${encodeURIComponent(S.cur)}/kubeconfigs/all" title="Download it">${icon('download', 'sm')}</a></div>
+      <div class="small muted">Contexts: ${all.contexts.map(c => `<span class="mono">${esc(c)}</span>`).join(', ')}</div>
+    </div>` : '';
   const fetchable = KINDS.filter(k => avail(k).ok);
   el.innerHTML = cardHead('key', 'Kubeconfigs', fetchable.length > 1
     ? `<button class="btn small" data-fetch="${fetchable.join(',')}" ${busy || auto ? 'disabled' : ''}>${busy ? '<span class="spinner"></span>' : icon('download')}Fetch all</button>` : '')
-    + `<div class="card-body">${KINDS.map(entry).join('')}</div>`;
+    + `<div class="card-body">${KINDS.map(entry).join('')}${combined}</div>`;
   $$('[data-fetch]', el).forEach(b => b.onclick = () => fetchKube(b.dataset.fetch.split(',')));
   $$('[data-forget]', el).forEach(b => b.onclick = () => forgetKube(b.dataset.forget));
 }

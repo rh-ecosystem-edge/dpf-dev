@@ -13,7 +13,7 @@ from another profile's settings, duplicate it.
 
 Other locations (each overridable with an env var):
 
-    ~/.kube/dpf-dev/<name>/      KUBECONFIG_DIR (DPFGUI_KUBECONFIG_DIR): mgmt/hcp.kubeconfig
+    ~/.kube/dpf-dev/<name>/      KUBECONFIG_DIR (DPFGUI_KUBECONFIG_DIR): mgmt/hcp.kubeconfig, all.kubeconfig (both)
     ~/.local/state/dpf-dev/      STATE_DIR (DPFGUI_STATE_DIR, honours XDG_STATE_HOME)
 """
 

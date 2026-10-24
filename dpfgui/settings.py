@@ -307,6 +307,9 @@ def simulated_dpu_rules(eff: dict, wc: int, add) -> None:
     elif real and only:
         add("SIMULATED_DPUS_ONLY", "error", "Only for simulated DPU hosts; this profile's are real",
             {"op": "set", "key": "SIMULATED_DPUS_ONLY", "value": "false", "label": "Turn off"})
+    if only and eff.get("DPF_DEPLOYMENT_MODE") != "zero-trust" and eff.get("NODES_MTU", "1500") != "1500":
+        add("NODES_MTU", "error", "Simulated DPUs need 1500: their traffic leaves through the lab LAN",
+            {"op": "set", "key": "NODES_MTU", "value": "1500", "label": "Set 1500"})
     if only and not eff.get("DPUSIMAAS_URL"):
         add("DPUSIMAAS_URL", "error", "Required with SIMULATED_DPUS_ONLY",
             {"op": "set", "key": "DPUSIMAAS_URL", "value": simdpus.URL, "label": f"Use {simdpus.URL}"})

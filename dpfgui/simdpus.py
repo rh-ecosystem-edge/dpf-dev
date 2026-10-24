@@ -46,9 +46,13 @@ def leases(owner: str) -> list[dict]:
     return _call("GET", f"/v1/dpus?owner={urllib.request.quote(owner)}")
 
 
-def lease(owner: str, mode: str, bmc_password: str) -> dict:
+def lease(owner: str, mode: str, bmc_password: str, cluster: str = "") -> dict:
     """A new simulated DPU (getting its address from DHCP takes a few seconds)."""
-    return _call("POST", "/v1/dpus", {"owner": owner, "mode": mode, "bmc_password": bmc_password}, timeout=120)
+    # A cluster's DPUs share one simulated leaf router, which its nodes route the DPUs' VTEPs through.
+    body = {"owner": owner, "mode": mode, "bmc_password": bmc_password}
+    if cluster:
+        body["cluster"] = cluster
+    return _call("POST", "/v1/dpus", body, timeout=120)
 
 
 def release(lease_id: str) -> None:
