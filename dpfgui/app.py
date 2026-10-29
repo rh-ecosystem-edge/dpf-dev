@@ -532,7 +532,8 @@ async def lease_sim_dpu(name: str, body: SimDpuIn):
             await asyncio.to_thread(simdpus.release, lease["id"])
         raise
     # What a simulated DPU brings besides its slot: the simulated-DPU deployment (SIMULATED_DPUS_ONLY),
-    # host-trusted at MTU 1500 (its traffic leaves through the lab LAN); in Zero Trust, the BMC password and static discovery (its address comes from DHCP, so a scanned
+    # host-trusted at MTU 1500 (its traffic leaves through the lab LAN) with the host's CSRs approved
+    # (no one is watching for them); in Zero Trust, the BMC password and static discovery (its address comes from DHCP, so a scanned
     # range around it would reach other people's BMCs).
     extra = {}
     if before.get("SIMULATED_DPUS_ONLY") != "true":
@@ -541,6 +542,8 @@ async def lease_sim_dpu(name: str, body: SimDpuIn):
         extra["DPUSIMAAS_URL"] = simdpus.URL
     if mode == "host-trusted" and before.get("NODES_MTU", "1500") != "1500":
         extra["NODES_MTU"] = "1500"
+    if mode == "host-trusted" and before.get("AUTO_APPROVE_WORKER_CSR") != "true":
+        extra["AUTO_APPROVE_WORKER_CSR"] = "true"
     if mode == "zero-trust" and not before.get("ZT_DPU_BMC_ROOT_PASSWORD"):
         extra["ZT_DPU_BMC_ROOT_PASSWORD"] = password
     if mode == "zero-trust" and before.get("ZT_DPU_DISCOVERY_MODE", "scanning") != "static":
